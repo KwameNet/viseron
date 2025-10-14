@@ -1,0 +1,29 @@
+import ComponentConfiguration from "@site/src/pages/components-explorer/_components/ComponentConfiguration";
+import ComponentHeader from "@site/src/pages/components-explorer/_components/ComponentHeader";
+import ComponentTroubleshooting from "@site/src/pages/components-explorer/_components/ComponentTroubleshooting/index.mdx";
+
+import ComponentMetadata from "./_meta";
+import config from "./config.json";
+import ObjectDetector from "@site/src/pages/components-explorer/_domains/object_detector/index.mdx";
+
+<ComponentHeader meta={ComponentMetadata} />
+
+-- Provide short summary here --
+
+## Configuration
+
+<details>
+  <summary>Configuration example</summary>
+
+```yaml title="/config/config.yaml"
+Config example here
+```
+
+</details>
+
+<ComponentConfiguration meta={ComponentMetadata} config={config} />
+
+<ObjectDetector meta={ComponentMetadata} labelPath={<CHANGEME>} />
+
+<ComponentTroubleshooting meta={ComponentMetadata} />
+

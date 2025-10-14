@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 
 COMPONENT = "storage"
 
-DATABASE_URL = "postgresql://postgres@localhost/viseron"
+DATABASE_URL = "postgresql+psycopg2://viseron:viseron@pgdb:5432/viseron"
 ENGINE = create_engine(DATABASE_URL, connect_args={"options": "-c timezone=UTC"})
 
 

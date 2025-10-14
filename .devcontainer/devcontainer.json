@@ -32,7 +32,7 @@
     }
   },
   "userEnvProbe": "loginInteractiveShell",
-  "runArgs": ["-e", "GIT_EDITOR=code --wait"],
+  "runArgs": ["-e", "GIT_EDITOR=code --wait", "--network=visnet"],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -110,5 +110,15 @@
   },
   "features": {
     "ghcr.io/devcontainers/features/sshd:1": {}
-  }
+  },
+  "mounts": [
+  "source=C:/Users/fmensah/Documents/viseron/segments,target=/workspaces/viseron_dev/segments,type=bind,consistency=cached",
+  "source=C:/Users/fmensah/Documents/viseron/snapshots,target=/workspaces/viseron_dev/snapshots,type=bind,consistency=cached",
+  "source=C:/Users/fmensah/Documents/viseron/thumbnails,target=/workspaces/viseron_dev/thumbnails,type=bind,consistency=cached",
+  "source=C:/Users/fmensah/Documents/viseron/event_clips,target=/workspaces/viseron_dev/event_clips,type=bind,consistency=cached",
+  "source=C:/Users/fmensah/Documents/viseron/config,target=/workspaces/viseron_dev/config,type=bind,consistency=cached",
+  "source=/etc/localtime,target=/etc/localtime,type=bind,consistency=cached"
+
+  ]
+
 }
