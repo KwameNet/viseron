@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import cv2
-import numpy as np
 import torch
 
 from .model_zoo import build_model
@@ -56,10 +55,8 @@ class TorchvisionDetector:
     def infer(self, frame_bgr) -> list[Detection]:
         """Run inference on a single BGR frame (numpy array)."""
         image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image = image.transpose((2, 0, 1))
-        image = np.expand_dims(image, axis=0)
-        image = image / 255.0
         tensor = to_tensor(image, self.device)
+        # tensor = tensor.unsqueeze(0)  # Add batch dimension
         inputs = [tensor]
 
         if self.use_amp and self.device.type == "cuda":
