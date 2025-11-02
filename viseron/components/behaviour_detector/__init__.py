@@ -311,12 +311,113 @@ class BehaviourDetector:
                 LOGGER.debug("camera %s get_latest_frame failed", cam_id, exc_info=True)
         return None
 
+    def _compose_label(
+        self, behaviour: str, score: float | None, track_id: str | None
+    ) -> str:
+        """Build the overlay text label."""
+        label = behaviour
+        if score is not None:
+            try:
+                label += f" {float(score):.2f}"
+            except (ValueError, TypeError):
+                # Only catch expected conversion errors when formatting score
+                pass
+        if track_id:
+            label += f" id={track_id}"
+        return label
+
+    def _draw_overlay(
+        self, frame: np.ndarray, bbox_in: list[int] | None, label: str
+    ) -> None:
+        """Safely draw bounding box and label text."""
+        if bbox_in is None:
+            return
+        try:
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = map(int, bbox_in)
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return
+
+            color = (0, 0, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale, thickness = 0.6, 1
+            ((tw, th), _) = cv2.getTextSize(label, font, scale, thickness)
+            tx, ty = x1, max(y1 - 6, th + 6)
+            cv2.rectangle(
+                frame, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), color, -1
+            )
+            cv2.putText(
+                frame,
+                label,
+                (tx, ty - 2),
+                font,
+                scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+        except (ValueError, TypeError, AttributeError, cv2.error) as exc:
+            LOGGER.debug("Failed to draw overlay for clip: %s", exc, exc_info=True)
+
+    def _write_clip_to_disk(
+        self,
+        camera_id: str,
+        behaviour: str,
+        timestamp: float,
+        frames: list[np.ndarray],
+        bbox: list[int] | None,
+        label_text: str,
+        fps: float,
+    ) -> str:
+        """Write frames to disk as mp4, drawing bbox/label if provided."""
+        if not frames:
+            return ""
+
+        h, w = frames[0].shape[:2]
+        fourcc = getattr(cv2, "VideoWriter_fourcc", lambda *args: 0)(*"mp4v")
+        out_path = clip_output_path(
+            self.clip_output_dir, camera_id, behaviour, timestamp
+        )
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+        for f in frames:
+            frame_draw = f.copy()
+            self._draw_overlay(frame_draw, bbox, label_text)
+            if frame_draw.dtype != np.uint8:
+                frame_draw = (frame_draw * 255).astype(np.uint8)
+            writer.write(frame_draw)
+
+        try:
+            writer.release()
+        except cv2.error as exc:
+            LOGGER.debug("VideoWriter.release() failed: %s", exc)
+        except AttributeError as exc:
+            LOGGER.debug("VideoWriter.release() failed: %s", exc)
+        except RuntimeError as exc:
+            LOGGER.debug("VideoWriter.release() failed: %s", exc)
+
+        LOGGER.info(
+            "Saved behaviour clip %s for camera=%s behaviour=%s",
+            out_path,
+            camera_id,
+            behaviour,
+        )
+        return out_path
+
     def _save_clip_thread(
         self,
         camera_id: str,
         behaviour: str,
         timestamp: float,
         pre_frames: list[np.ndarray],
+        bbox: list[int] | None = None,
+        track_id: str | None = None,
+        score: float | None = None,
     ):
         """Worker to collect post frames and write clip to disk (non-blocking)."""
         try:
@@ -339,43 +440,14 @@ class BehaviourDetector:
                     behaviour,
                 )
                 return
+            # prepare label overlay
+            label_text = self._compose_label(behaviour, score, track_id)
 
-            # determine frame size
-            h, w = frames_to_write[0].shape[:2]
-            # determine FOURCC function (some OpenCV builds expose different names)
-            fourcc_func = getattr(cv2, "VideoWriter_fourcc", None)
-            if fourcc_func is None:
-                fourcc_func = getattr(getattr(cv2, "VideoWriter", None), "fourcc", None)
-            if fourcc_func is not None:
-                fourcc = fourcc_func(*"mp4v")
-            else:
-                # fallback to 0 which lets OpenCV choose a default codec if available
-                fourcc = 0
-            out_path = clip_output_path(
-                self.clip_output_dir, camera_id, behaviour, timestamp
+            # Write video with overlay
+            out_path = self._write_clip_to_disk(
+                camera_id, behaviour, timestamp, frames_to_write, bbox, label_text, fps
             )
-            # ensure output directory exists
-            try:
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            except OSError:
-                # Ignore filesystem-related errors
-                pass
-            writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
-            for f in frames_to_write:
-                # ensure BGR uint8
-                if f.dtype != np.uint8:
-                    f = (f * 255).astype(np.uint8)
-                writer.write(f)
-            try:
-                writer.release()
-            except (AttributeError, cv2.error, RuntimeError, OSError) as exc:
-                LOGGER.debug("VideoWriter.release() failed: %s", exc)
-            LOGGER.info(
-                "Saved behaviour clip %s for camera=%s behaviour=%s",
-                out_path,
-                camera_id,
-                behaviour,
-            )
+
             # publish clip path to vis.data alongside alerts
             key = behaviour_alerts_key(camera_id)
             existing = self.vis.data.get(key, [])
@@ -527,7 +599,7 @@ class BehaviourDetector:
     def _crop_frame(
         self,
         frame: np.ndarray,
-        bbox: list[int],
+        bbox: list[int] | None,
         min_size: tuple[int, int] = (8, 8),
     ) -> np.ndarray | None:
         """Safely crop `frame` with bbox = [x1,y1,x2,y2].
@@ -620,9 +692,7 @@ class BehaviourDetector:
                     alerts = self._process_tracks(cam_id, tracks, frame)
 
                     # publish alerts for this camera
-                    existing = self.vis.data.get(behaviour_alerts_key(cam_id), [])
-                    existing.extend(alerts)
-                    self.vis.data[behaviour_alerts_key(cam_id)] = existing
+                    self._publish_alerts(cam_id, alerts)
 
                 time.sleep(0.01)
             except (
