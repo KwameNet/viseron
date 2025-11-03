@@ -23,26 +23,26 @@ behaviour_detector:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from collections import defaultdict, deque
 from typing import Any
 
-import cv2
 import numpy as np
 import torch
 from torchvision import models, transforms as T
 
 from viseron import Viseron
+from viseron.domains.object_detector.const import EVENT_OBJECTS_IN_FOV
+from viseron.domains.object_detector.detected_object import (
+    DetectedObject,
+    EventDetectedObjectsData,
+)
 
 from .config import (
     COMPONENT_REGISTRATION_KEY,
     CONF_BEHAVIOURS,
     CONF_CAMERAS,
-    CONF_CLIP_OUTPUT_DIR,
-    CONF_CLIP_POST_SEC,
-    CONF_CLIP_PRE_SEC,
     CONF_INPUT_SIZE,
     CONF_LSTM_PATH,
     CONF_REQUIRE_FRAME,
@@ -50,15 +50,11 @@ from .config import (
     CONF_SEQ_LEN,
     CONF_THRESHOLD,
     CONF_YOLO_MODEL,
-    DEFAULT_CLIP_OUTPUT_DIR,
-    DEFAULT_CLIP_POST_SEC,
-    DEFAULT_CLIP_PRE_SEC,
     DEFAULT_INPUT_SIZE,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_SEQ_LEN,
     DEFAULT_THRESHOLD,
     behaviour_alerts_key,
-    clip_output_path,
     detections_key,
 )
 from .lstm_model import LSTMClassifier
@@ -106,18 +102,6 @@ class BehaviourDetector:
         self.require_frame: bool = bool(config.get(CONF_REQUIRE_FRAME, True))
         self.sample_rate: int = int(config.get(CONF_SAMPLE_RATE, DEFAULT_SAMPLE_RATE))
 
-        # clip config
-        self.clip_pre_seconds: float = float(
-            config.get(CONF_CLIP_PRE_SEC, DEFAULT_CLIP_PRE_SEC)
-        )
-        self.clip_post_seconds: float = float(
-            config.get(CONF_CLIP_POST_SEC, DEFAULT_CLIP_POST_SEC)
-        )
-        self.clip_output_dir: str = str(
-            config.get(CONF_CLIP_OUTPUT_DIR, DEFAULT_CLIP_OUTPUT_DIR)
-        )
-        os.makedirs(self.clip_output_dir, exist_ok=True)
-
         # frame ring buffers: camera_id -> deque of (timestamp, frame)
         self._frame_buffers: dict[str, deque] = defaultdict(deque)
 
@@ -136,6 +120,13 @@ class BehaviourDetector:
                 CONF_THRESHOLD: float(bc.get(CONF_THRESHOLD, DEFAULT_THRESHOLD)),
                 CONF_INPUT_SIZE: int(bc.get(CONF_INPUT_SIZE, DEFAULT_INPUT_SIZE)),
             }
+
+        self._alerts_max: int = int(config.get("alerts_max", 200))  # max alerts
+        self._alerts_ttl: float = float(config.get("alerts_ttl", 3600.0))  # seconds;
+        self._alerts: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=self._alerts_max)
+        )
+        self._alerts_lock = threading.Lock()
 
         # per-camera trackers and frame counters
         self._trackers: dict[str, object | None] = {}
@@ -310,155 +301,6 @@ class BehaviourDetector:
             except (ValueError, TypeError):
                 LOGGER.debug("camera %s get_latest_frame failed", cam_id, exc_info=True)
         return None
-
-    def _compose_label(
-        self, behaviour: str, score: float | None, track_id: str | None
-    ) -> str:
-        """Build the overlay text label."""
-        label = behaviour
-        if score is not None:
-            try:
-                label += f" {float(score):.2f}"
-            except (ValueError, TypeError):
-                # Only catch expected conversion errors when formatting score
-                pass
-        if track_id:
-            label += f" id={track_id}"
-        return label
-
-    def _draw_overlay(
-        self, frame: np.ndarray, bbox_in: list[int] | None, label: str
-    ) -> None:
-        """Safely draw bounding box and label text."""
-        if bbox_in is None:
-            return
-        try:
-            h, w = frame.shape[:2]
-            x1, y1, x2, y2 = map(int, bbox_in)
-            x1, x2 = max(0, x1), min(w, x2)
-            y1, y2 = max(0, y1), min(h, y2)
-            if x2 <= x1 or y2 <= y1:
-                return
-
-            color = (0, 0, 255)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            scale, thickness = 0.6, 1
-            ((tw, th), _) = cv2.getTextSize(label, font, scale, thickness)
-            tx, ty = x1, max(y1 - 6, th + 6)
-            cv2.rectangle(
-                frame, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), color, -1
-            )
-            cv2.putText(
-                frame,
-                label,
-                (tx, ty - 2),
-                font,
-                scale,
-                (255, 255, 255),
-                thickness,
-                cv2.LINE_AA,
-            )
-        except (ValueError, TypeError, AttributeError, cv2.error) as exc:
-            LOGGER.debug("Failed to draw overlay for clip: %s", exc, exc_info=True)
-
-    def _write_clip_to_disk(
-        self,
-        camera_id: str,
-        behaviour: str,
-        timestamp: float,
-        frames: list[np.ndarray],
-        bbox: list[int] | None,
-        label_text: str,
-        fps: float,
-    ) -> str:
-        """Write frames to disk as mp4, drawing bbox/label if provided."""
-        if not frames:
-            return ""
-
-        h, w = frames[0].shape[:2]
-        fourcc = getattr(cv2, "VideoWriter_fourcc", lambda *args: 0)(*"mp4v")
-        out_path = clip_output_path(
-            self.clip_output_dir, camera_id, behaviour, timestamp
-        )
-
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-        writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
-        for f in frames:
-            frame_draw = f.copy()
-            self._draw_overlay(frame_draw, bbox, label_text)
-            if frame_draw.dtype != np.uint8:
-                frame_draw = (frame_draw * 255).astype(np.uint8)
-            writer.write(frame_draw)
-
-        try:
-            writer.release()
-        except cv2.error as exc:
-            LOGGER.debug("VideoWriter.release() failed: %s", exc)
-        except AttributeError as exc:
-            LOGGER.debug("VideoWriter.release() failed: %s", exc)
-        except RuntimeError as exc:
-            LOGGER.debug("VideoWriter.release() failed: %s", exc)
-
-        LOGGER.info(
-            "Saved behaviour clip %s for camera=%s behaviour=%s",
-            out_path,
-            camera_id,
-            behaviour,
-        )
-        return out_path
-
-    def _save_clip_thread(
-        self,
-        camera_id: str,
-        behaviour: str,
-        timestamp: float,
-        pre_frames: list[np.ndarray],
-        bbox: list[int] | None = None,
-        track_id: str | None = None,
-        score: float | None = None,
-    ):
-        """Worker to collect post frames and write clip to disk (non-blocking)."""
-        try:
-            fps = self._camera_fps.get(camera_id, 30.0)
-            # collect post frames
-            post_frames = []
-            end_time = time.time() + self.clip_post_seconds
-            while time.time() < end_time:
-                frame = self._get_camera_frame(camera_id)
-                if frame is not None:
-                    post_frames.append(frame.copy())
-                # sleep to match FPS sampling
-                time.sleep(max(1.0 / fps * 0.5, 0.02))
-
-            frames_to_write = pre_frames + post_frames
-            if not frames_to_write:
-                LOGGER.debug(
-                    "No frames to write for clip camera=%s behaviour=%s",
-                    camera_id,
-                    behaviour,
-                )
-                return
-            # prepare label overlay
-            label_text = self._compose_label(behaviour, score, track_id)
-
-            # Write video with overlay
-            out_path = self._write_clip_to_disk(
-                camera_id, behaviour, timestamp, frames_to_write, bbox, label_text, fps
-            )
-
-            # publish clip path to vis.data alongside alerts
-            key = behaviour_alerts_key(camera_id)
-            existing = self.vis.data.get(key, [])
-            existing.append(
-                {"clip_path": out_path, "timestamp": timestamp, "behaviour": behaviour}
-            )
-            self.vis.data[key] = existing
-        except (ValueError, TypeError, RuntimeError):
-            LOGGER.exception(
-                "Failed saving clip for camera=%s behaviour=%s", camera_id, behaviour
-            )
 
     def _get_detections_for_tracker(
         self, cam_id: str, frame
@@ -673,10 +515,140 @@ class BehaviourDetector:
                 seqs.clear()
         return alerts
 
+    def _get_shared_frame(self, cam_id: str):
+        """Return current SharedFrame from the camera if available."""
+        cam = None
+        try:
+            domains = getattr(self.vis, "domains", None)
+            if isinstance(domains, dict):
+                cam_domain = domains.get("camera") or domains.get(
+                    "viseron.domains.camera"
+                )
+                if isinstance(cam_domain, dict):
+                    cam = cam_domain.get(cam_id)
+        except (AttributeError, TypeError):
+            cam = None
+        if cam is None:
+            try:
+                ffmpeg_comp = self.vis.data.get("ffmpeg")
+                if isinstance(ffmpeg_comp, dict):
+                    cam = ffmpeg_comp.get(cam_id)
+            except (AttributeError, TypeError):
+                cam = None
+        return getattr(cam, "current_frame", None) if cam is not None else None
+
+    def _make_detected_object(
+        self,
+        behaviour: str,
+        score: float | None,
+        bbox: list[int] | None,
+        frame_shape: tuple[int, int] | None,
+    ) -> DetectedObject | None:
+        """Create a real DetectedObject from absolute bbox.
+
+        returns None if not possible.
+        """
+
+        try:
+            label = str(behaviour)
+            conf = float(score) if score is not None else 0.0
+
+            # Determine frame size
+            if frame_shape and len(frame_shape) >= 2:
+                h, w = int(frame_shape[0]), int(frame_shape[1])
+            else:
+                h, w = 1, 1  # safe fallback
+
+            # Compute absolute box (defaults to full frame if bbox missing)
+            #            if bbox and len(bbox) >= 4:
+            if bbox and len(bbox) >= 4:
+                x1, y1, x2, y2 = (int(v) for v in bbox[:4])
+                # Clamp and ensure positive area
+                x1 = max(0, min(w - 1, x1))
+                y1 = max(0, min(h - 1, y1))
+                x2 = max(x1 + 1, min(w, x2))
+                y2 = max(y1 + 1, min(h, y2))
+            else:
+                x1, y1, x2, y2 = 0, 0, max(1, w), max(1, h)
+
+            # Construct DetectedObject with absolute coords + frame_res (positional)
+            obj = DetectedObject(label, conf, x1, y1, x2, y2, (w, h))
+
+            # Mark flags expected by the recorder pipeline
+            obj.trigger_event_recording = True
+            obj.store = True
+            obj.relevant = True
+            return obj
+        except (ValueError, TypeError, IndexError, AttributeError):
+            LOGGER.debug(
+                "Failed to build DetectedObject for behaviour=%s",
+                behaviour,
+                exc_info=True,
+            )
+            return None
+
+    def _emit_objects_in_fov(self, cam_id: str, alerts: list, frame) -> None:
+        """Emit behaviour detections as EVENT_OBJECTS_IN_FOV for this camera."""
+        if not alerts:
+            return
+
+        frame_shape = None
+        try:
+            if frame is not None and hasattr(frame, "shape"):
+                frame_shape = (int(frame.shape[0]), int(frame.shape[1]))
+        except (AttributeError, TypeError, ValueError):
+            frame_shape = None
+
+        objects: list[DetectedObject] = []
+        for a in alerts:
+            obj = self._make_detected_object(
+                behaviour=str(a.get("behaviour", "behaviour")),
+                score=a.get("score"),
+                bbox=a.get("bbox"),
+                frame_shape=frame_shape,
+            )
+            if obj is not None:
+                objects.append(obj)
+
+        if not objects:
+            return
+
+        shared_frame = self._get_shared_frame(cam_id)
+        try:
+            self.vis.dispatch_event(
+                EVENT_OBJECTS_IN_FOV.format(camera_identifier=cam_id),
+                EventDetectedObjectsData(
+                    camera_identifier=cam_id,
+                    shared_frame=shared_frame,
+                    objects=objects,
+                ),
+            )
+        except (RuntimeError, ValueError, TypeError, AttributeError, OSError):
+            LOGGER.debug(
+                "Failed to dispatch EVENT_OBJECTS_IN_FOV for camera %s",
+                cam_id,
+                exc_info=True,
+            )
+
     def _publish_alerts(self, cam_id, alerts):
-        existing = self.vis.data.get(behaviour_alerts_key(cam_id), [])
-        existing.extend(alerts)
-        self.vis.data[behaviour_alerts_key(cam_id)] = existing
+        """Store recent alerts in bounded, TTL-pruned buffer and mirror to vis.data."""
+        if not alerts:
+            return
+        now = time.time()
+        with self._alerts_lock:
+            dq = self._alerts[cam_id]  # deque with maxlen=self._alerts_max
+            # append new alerts (ensure timestamp present)
+            for a in alerts:
+                if "timestamp" not in a:
+                    a = {**a, "timestamp": now}
+                dq.append(a)
+            # TTL prune from the left
+            if self._alerts_ttl > 0:
+                cutoff = now - self._alerts_ttl
+                while dq and float(dq[0].get("timestamp", now)) < cutoff:
+                    dq.popleft()
+            # mirror snapshot to vis.data for external readers
+            self.vis.data[behaviour_alerts_key(cam_id)] = list(dq)
 
     def _run(self) -> None:
         LOGGER.info("Behaviour detector started for cameras: %s", self.cameras)
@@ -693,6 +665,8 @@ class BehaviourDetector:
 
                     # publish alerts for this camera
                     self._publish_alerts(cam_id, alerts)
+                    # emit objects_in_fov so camera recorder can react
+                    self._emit_objects_in_fov(cam_id, alerts, frame)
 
                 time.sleep(0.01)
             except (
